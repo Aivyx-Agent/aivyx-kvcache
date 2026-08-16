@@ -1,0 +1,15 @@
+[package]
+name = "aivyx-kvcache"
+description = "Backend-agnostic local KV-cache persistence/sharing layer for local LLM serving"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+async-trait = "0.1.89"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
