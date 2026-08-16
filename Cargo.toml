@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-trait = "0.1.89"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["sync"] }
 

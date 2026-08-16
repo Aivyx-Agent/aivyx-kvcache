@@ -5,6 +5,8 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
+mod manifest;
+
 /// Identifies one cached prefix. Two turns produce the same key only when
 /// they'd prefill identically: same backend, same model/build, and an
 /// identical **stable** prompt prefix — system prompt + tool defs + repo
