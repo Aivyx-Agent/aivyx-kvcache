@@ -47,6 +47,22 @@ impl CacheHandle {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// True if this handle is safe to join onto a directory and pass to
+    /// `remove_file`: exactly one normal path component -- no separators,
+    /// no `.`/`..`, not absolute. Handles this crate's own stores produce
+    /// (via `slot_filename` in `llama_server.rs`) always satisfy this;
+    /// this guards the delete path against a future caller of the public
+    /// `record()` API supplying an unsanitized handle that could
+    /// otherwise reach the filesystem with a path-traversal-shaped value.
+    pub(crate) fn is_safe_filename(&self) -> bool {
+        let path = std::path::Path::new(&self.0);
+        path.components().count() == 1
+            && matches!(
+                path.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+    }
 }
 
 /// Size/shape metadata recorded alongside a saved entry.
@@ -133,6 +149,14 @@ mod tests {
     fn cache_handle_round_trips_its_id() {
         let h = CacheHandle::new("some-filename.slot");
         assert_eq!(h.as_str(), "some-filename.slot");
+    }
+
+    #[test]
+    fn cache_handle_is_safe_filename_rejects_path_traversal_shapes() {
+        assert!(CacheHandle::new("foo-bar.slot").is_safe_filename());
+        assert!(!CacheHandle::new("../../etc/passwd").is_safe_filename());
+        assert!(!CacheHandle::new("/etc/passwd").is_safe_filename());
+        assert!(!CacheHandle::new("a/b").is_safe_filename());
     }
 
     #[test]

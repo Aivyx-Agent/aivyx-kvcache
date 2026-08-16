@@ -19,23 +19,36 @@ pub struct LlamaServerSlotStore {
 
 /// Deterministic, filesystem- and llama-server-safe filename for `key`'s
 /// on-disk `.slot` file. Every key component is normalized (non-
-/// alphanumeric/`-`/`_` characters replaced with `_`) before being folded
-/// into one flat name -- two things this guards against: llama-server's
-/// `/slots` API takes a bare filename (no path separators), so a nested
-/// per-backend/per-model directory scheme (the previous convention here)
-/// can never actually be produced by asking llama-server to save there;
-/// and `backend_id`/`model_id`/`build_hash` are free-form strings with no
-/// guaranteed format, so leaving them unnormalized would let a value like
-/// `../../etc` reach `std::fs::remove_file` during eviction. All four key
-/// fields are included (not just `prefix_hash`) so that two `CacheKey`s
-/// which differ only by model/build never collide on the same physical
-/// file -- `prefix_hash` alone is deliberately model-agnostic (see its
-/// own doc comment on `CacheKey`), so the filename must carry the rest.
+/// alphanumeric/`_` characters, including `-`, replaced with `_`) before
+/// being folded into one flat name -- two things this guards against:
+/// llama-server's `/slots` API takes a bare filename (no path separators),
+/// so a nested per-backend/per-model directory scheme (the previous
+/// convention here) can never actually be produced by asking llama-server
+/// to save there; and `backend_id`/`model_id`/`build_hash` are free-form
+/// strings with no guaranteed format, so leaving them unnormalized would
+/// let a value like `../../etc` reach `std::fs::remove_file` during
+/// eviction. All four key fields are included (not just `prefix_hash`) so
+/// that two `CacheKey`s which differ only by model/build never collide on
+/// the same physical file -- `prefix_hash` alone is deliberately
+/// model-agnostic (see its own doc comment on `CacheKey`), so the filename
+/// must carry the rest.
+///
+/// `-` is normalized away (mapped to `_`) specifically because it's also
+/// used below as the field delimiter -- otherwise a normalized field could
+/// itself contain the delimiter, letting two different `CacheKey`s (e.g.
+/// `{backend:"llama", model:"server-qwen"}` vs.
+/// `{backend:"llama-server", model:"qwen"}`) produce the identical joined
+/// text. And because normalization is inherently lossy (`.`/`:`/`/` all
+/// collapse to the same `_`, so e.g. `"qwen3.5:32b"` and `"qwen3_5_32b"`
+/// also collide), an unambiguous delimiter alone isn't enough -- the
+/// trailing hash of the raw, un-normalized four-tuple is what actually
+/// guarantees two distinct `CacheKey`s produce two distinct filenames; the
+/// normalized fields are kept only for human readability.
 pub(crate) fn slot_filename(key: &CacheKey) -> String {
     fn normalize(s: &str) -> String {
         s.chars()
             .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                if c.is_ascii_alphanumeric() || c == '_' {
                     c
                 } else {
                     '_'
@@ -43,13 +56,34 @@ pub(crate) fn slot_filename(key: &CacheKey) -> String {
             })
             .collect()
     }
+    let hash = fnv1a(
+        format!(
+            "{}\u{0}{}\u{0}{}\u{0}{}",
+            key.backend_id, key.model_id, key.build_hash, key.prefix_hash
+        )
+        .as_bytes(),
+    );
     format!(
-        "{}-{}-{}-{}.slot",
+        "{}-{}-{}-{}-{:016x}.slot",
         normalize(&key.backend_id),
         normalize(&key.model_id),
         normalize(&key.build_hash),
         normalize(&key.prefix_hash),
+        hash,
     )
+}
+
+/// Plain FNV-1a, used only to disambiguate `slot_filename`'s otherwise-
+/// lossy normalization -- not required to match any other implementation
+/// byte-for-byte (unlike e.g. aivyx-recall's own `fnv1a`, which has a
+/// documented cross-repo stability requirement this one does not share).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 impl LlamaServerSlotStore {
@@ -198,6 +232,15 @@ impl KvCacheStore for LlamaServerSlotStore {
         let removed = self.manifest.evict_and_remove(self.max_bytes).await?;
         let mut report = EvictionReport::default();
         for row in removed {
+            if !row.handle.is_safe_filename() {
+                tracing::warn!(
+                    handle = row.handle.as_str(),
+                    "kvcache manifest row had an unsafe handle; skipping file deletion (row is already removed from the manifest)"
+                );
+                report.evicted_count += 1;
+                report.bytes_freed += row.size_bytes;
+                continue;
+            }
             let path = self.slots_dir.join(row.handle.as_str());
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -227,6 +270,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slot_filename_normalizes_path_traversal_attempts() {
+        let key = CacheKey {
+            backend_id: "../../etc".into(),
+            model_id: "../../etc".into(),
+            build_hash: "b1".into(),
+            prefix_hash: "p1".into(),
+        };
+        let filename = slot_filename(&key);
+        assert!(!filename.contains('/'));
+        assert!(!filename.contains(".."));
+        let path = std::path::Path::new(&filename);
+        assert_eq!(path.components().count(), 1);
+    }
+
+    #[test]
+    fn slot_filename_differs_for_keys_that_differ_only_in_model_id() {
+        let a = CacheKey {
+            backend_id: "llama-server".into(),
+            model_id: "model-a".into(),
+            build_hash: "b1".into(),
+            prefix_hash: "p1".into(),
+        };
+        let b = CacheKey {
+            model_id: "model-b".into(),
+            ..a.clone()
+        };
+        assert_ne!(slot_filename(&a), slot_filename(&b));
+    }
+
+    #[test]
+    fn slot_filename_differs_even_when_normalization_would_otherwise_collide() {
+        // Without the hash suffix, both keys' normalized text would collide:
+        // "llama" + "server-qwen" and "llama-server" + "qwen" both normalize
+        // their `-` to `_`, producing the same joined text either way.
+        let a = CacheKey {
+            backend_id: "llama".into(),
+            model_id: "server-qwen".into(),
+            build_hash: "b1".into(),
+            prefix_hash: "p1".into(),
+        };
+        let b = CacheKey {
+            backend_id: "llama-server".into(),
+            model_id: "qwen".into(),
+            build_hash: "b1".into(),
+            prefix_hash: "p1".into(),
+        };
+        assert_ne!(slot_filename(&a), slot_filename(&b));
+    }
+
     #[tokio::test]
     async fn satisfies_the_kv_cache_store_contract() {
         let dir = tempfile::tempdir().unwrap();
@@ -241,7 +334,6 @@ mod tests {
 
         let k = key("p1");
         let path = store.slot_path(&k);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"fake kv cache bytes").unwrap();
 
         store

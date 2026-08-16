@@ -52,7 +52,22 @@ pub async fn prune(
     let removed = manifest.evict_and_remove(target_bytes).await?;
     let mut evicted = 0u64;
     let mut freed = 0u64;
+    let mut skipped_unsafe = 0u64;
     for row in removed {
+        // The manifest row is already gone (evict_and_remove removed it
+        // inside its transaction) regardless of what happens below -- this
+        // only gates the *file* deletion attempt. A handle that isn't a
+        // safe single-component filename is never produced by this crate's
+        // own stores, only by a hypothetical future caller of the public
+        // `record()` API; skip deleting it rather than joining it onto
+        // `slots_dir` and handing a path-traversal-shaped value to
+        // `remove_file`.
+        if !row.handle.is_safe_filename() {
+            skipped_unsafe += 1;
+            evicted += 1;
+            freed += row.size_bytes;
+            continue;
+        }
         let path = slots_dir.join(row.handle.as_str());
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -62,7 +77,13 @@ pub async fn prune(
         evicted += 1;
         freed += row.size_bytes;
     }
-    Ok(format!("evicted {evicted} slots, freed {freed} bytes"))
+    if skipped_unsafe > 0 {
+        Ok(format!(
+            "evicted {evicted} slots, freed {freed} bytes ({skipped_unsafe} had an unsafe handle and were not deleted from disk)"
+        ))
+    } else {
+        Ok(format!("evicted {evicted} slots, freed {freed} bytes"))
+    }
 }
 
 #[cfg(test)]
