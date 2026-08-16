@@ -302,22 +302,33 @@ mod tests {
 
     #[test]
     fn slot_filename_differs_even_when_normalization_would_otherwise_collide() {
-        // Without the hash suffix, both keys' normalized text would collide:
-        // "llama" + "server-qwen" and "llama-server" + "qwen" both normalize
-        // their `-` to `_`, producing the same joined text either way.
+        // Normalization is lossy: '.' and '_' both map to '_', so
+        // "qwen3.5" and "qwen3_5" produce byte-identical *normalized* text
+        // even though they're distinct raw model ids. Without the raw-field
+        // hash suffix, these two keys' filenames would be indistinguishable
+        // -- confirmed by checking the normalized portion (everything before
+        // the final `-<hash>.slot` segment) really is identical here, so
+        // the hash is what's actually doing the disambiguating work below,
+        // not an accidental difference elsewhere in the string.
         let a = CacheKey {
-            backend_id: "llama".into(),
-            model_id: "server-qwen".into(),
+            backend_id: "llama-server".into(),
+            model_id: "qwen3.5".into(),
             build_hash: "b1".into(),
             prefix_hash: "p1".into(),
         };
         let b = CacheKey {
-            backend_id: "llama-server".into(),
-            model_id: "qwen".into(),
-            build_hash: "b1".into(),
-            prefix_hash: "p1".into(),
+            model_id: "qwen3_5".into(),
+            ..a.clone()
         };
-        assert_ne!(slot_filename(&a), slot_filename(&b));
+        let (filename_a, filename_b) = (slot_filename(&a), slot_filename(&b));
+        let normalized_prefix = |f: &str| f.rsplit_once('-').unwrap().0.to_string();
+        assert_eq!(
+            normalized_prefix(&filename_a),
+            normalized_prefix(&filename_b),
+            "test setup is invalid: these two raw model ids must normalize \
+             to identical text for this test to actually exercise the hash"
+        );
+        assert_ne!(filename_a, filename_b);
     }
 
     #[tokio::test]
