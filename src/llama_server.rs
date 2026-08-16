@@ -7,14 +7,49 @@ use crate::{CacheHandle, CacheKey, CacheMeta, EvictionReport, KvCacheError, KvCa
 
 /// The real, llama-server-backed `KvCacheStore`. Drives llama-server's
 /// native `/slots/{id}?action=save|restore` API (see `restore_into_slot`/
-/// `save_from_slot`, added in a later commit) against files under
-/// `store_path/slots/`, indexed by a `Manifest` at `store_path/manifest.db`.
+/// `save_from_slot`) against files under `store_path/slots/`, indexed by a
+/// `Manifest` at `store_path/manifest.db`.
 pub struct LlamaServerSlotStore {
     manifest: Manifest,
     slots_dir: PathBuf,
     max_bytes: u64,
     base_url: String,
     http: reqwest::Client,
+}
+
+/// Deterministic, filesystem- and llama-server-safe filename for `key`'s
+/// on-disk `.slot` file. Every key component is normalized (non-
+/// alphanumeric/`-`/`_` characters replaced with `_`) before being folded
+/// into one flat name -- two things this guards against: llama-server's
+/// `/slots` API takes a bare filename (no path separators), so a nested
+/// per-backend/per-model directory scheme (the previous convention here)
+/// can never actually be produced by asking llama-server to save there;
+/// and `backend_id`/`model_id`/`build_hash` are free-form strings with no
+/// guaranteed format, so leaving them unnormalized would let a value like
+/// `../../etc` reach `std::fs::remove_file` during eviction. All four key
+/// fields are included (not just `prefix_hash`) so that two `CacheKey`s
+/// which differ only by model/build never collide on the same physical
+/// file -- `prefix_hash` alone is deliberately model-agnostic (see its
+/// own doc comment on `CacheKey`), so the filename must carry the rest.
+pub(crate) fn slot_filename(key: &CacheKey) -> String {
+    fn normalize(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+    format!(
+        "{}-{}-{}-{}.slot",
+        normalize(&key.backend_id),
+        normalize(&key.model_id),
+        normalize(&key.build_hash),
+        normalize(&key.prefix_hash),
+    )
 }
 
 impl LlamaServerSlotStore {
@@ -36,15 +71,22 @@ impl LlamaServerSlotStore {
         })
     }
 
-    /// Where the on-disk `.slot` file for `key` lives, by convention:
-    /// `slots/<backend_id>/<model_id>/<prefix_hash>.slot`. llama-server
-    /// itself is what actually writes/reads the file's contents (via its
-    /// `/slots` save/restore API) — this store only tracks and indexes it.
+    /// Where the on-disk `.slot` file for `key` lives: `slots_dir` joined
+    /// with `slot_filename(key)`. `slots_dir` (`store_path/slots`) is
+    /// exactly the directory an operator should point llama-server's own
+    /// `--slot-save-path` flag at -- llama-server's `/slots` API only ever
+    /// takes a bare filename, never a path, so this MUST stay flat (no
+    /// per-backend/per-model subdirectories: a prior version of this
+    /// method built a nested path that llama-server had no way to
+    /// actually write into, silently breaking eviction -- see
+    /// `slot_filename`'s doc comment for why the filename itself carries
+    /// the namespacing instead). Production code computes eviction paths
+    /// from the manifest row's own stored handle instead (see
+    /// `evict_to_budget`); this stays as a standalone primitive exercised
+    /// directly by tests below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn slot_path(&self, key: &CacheKey) -> PathBuf {
-        self.slots_dir
-            .join(&key.backend_id)
-            .join(&key.model_id)
-            .join(format!("{}.slot", key.prefix_hash))
+        self.slots_dir.join(slot_filename(key))
     }
 
     /// Look up `key`, and if found, ask llama-server to restore that saved
@@ -71,7 +113,14 @@ impl LlamaServerSlotStore {
             .await;
         match response {
             Ok(r) if r.status().is_success() => {
-                self.confirm_hit(key).await?;
+                // The restore itself already succeeded -- the slot is warm.
+                // A failure recording that fact (hit_count/recency
+                // bookkeeping) is real but non-fatal: losing an accounting
+                // update isn't worth telling the caller to discard an
+                // already-warmed slot and fall back to a cold request.
+                if let Err(err) = self.confirm_hit(key).await {
+                    tracing::warn!(error = %err, "kvcache confirm_hit failed after a successful restore; the restore itself still succeeded");
+                }
                 Ok(true)
             }
             Ok(r) => {
@@ -104,7 +153,7 @@ impl LlamaServerSlotStore {
                 max_bytes: self.max_bytes,
             });
         }
-        let filename = format!("{}.slot", key.prefix_hash);
+        let filename = slot_filename(key);
         let url = format!("{}/slots/{slot_id}?action=save", self.base_url);
         self.http
             .post(&url)
@@ -146,16 +195,15 @@ impl KvCacheStore for LlamaServerSlotStore {
     }
 
     async fn evict_to_budget(&self) -> Result<EvictionReport, KvCacheError> {
-        let candidates = self.manifest.evict_candidates(self.max_bytes).await?;
+        let removed = self.manifest.evict_and_remove(self.max_bytes).await?;
         let mut report = EvictionReport::default();
-        for row in candidates {
-            let path = self.slot_path(&row.key);
+        for row in removed {
+            let path = self.slots_dir.join(row.handle.as_str());
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(KvCacheError::Backend(e.to_string())),
             }
-            self.manifest.remove(&row.key).await?;
             report.evicted_count += 1;
             report.bytes_freed += row.size_bytes;
         }
@@ -199,7 +247,7 @@ mod tests {
         store
             .record(
                 &k,
-                CacheHandle::new(format!("{}.slot", k.prefix_hash)),
+                CacheHandle::new(slot_filename(&k)),
                 CacheMeta {
                     size_bytes: 50,
                     token_count: 5,

@@ -40,8 +40,8 @@ pub async fn prune(
     dry_run: bool,
 ) -> Result<String, KvCacheError> {
     let manifest = Manifest::open(&store_path.join("manifest.db"))?;
-    let candidates = manifest.evict_candidates(target_bytes).await?;
     if dry_run {
+        let candidates = manifest.evict_candidates(target_bytes).await?;
         let bytes: u64 = candidates.iter().map(|r| r.size_bytes).sum();
         return Ok(format!(
             "dry run: would evict {count} slots, freeing {bytes} bytes",
@@ -49,19 +49,16 @@ pub async fn prune(
         ));
     }
     let slots_dir = store_path.join("slots");
+    let removed = manifest.evict_and_remove(target_bytes).await?;
     let mut evicted = 0u64;
     let mut freed = 0u64;
-    for row in candidates {
-        let path = slots_dir
-            .join(&row.key.backend_id)
-            .join(&row.key.model_id)
-            .join(format!("{}.slot", row.key.prefix_hash));
+    for row in removed {
+        let path = slots_dir.join(row.handle.as_str());
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(KvCacheError::Backend(e.to_string())),
         }
-        manifest.remove(&row.key).await?;
         evicted += 1;
         freed += row.size_bytes;
     }

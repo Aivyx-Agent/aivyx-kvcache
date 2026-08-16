@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use tokio::sync::Mutex;
 
 use crate::{CacheHandle, CacheKey, CacheMeta, KvCacheError};
@@ -131,6 +131,11 @@ impl Manifest {
         Ok(())
     }
 
+    /// Removes a single row by key. Production eviction paths use the
+    /// atomic `evict_and_remove` instead (see its doc comment for why a
+    /// separate select-then-delete isn't safe across processes); this
+    /// stays as a standalone primitive exercised directly by tests below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn remove(&self, key: &CacheKey) -> Result<(), KvCacheError> {
         let conn = self.conn.lock().await;
         conn.execute(
@@ -139,6 +144,65 @@ impl Manifest {
         )
         .map_err(|e| KvCacheError::Backend(e.to_string()))?;
         Ok(())
+    }
+
+    /// Atomically selects least-recently-used rows to evict (until total
+    /// recorded bytes are at or under `target_bytes`) and removes them
+    /// from the manifest, all inside a single `BEGIN IMMEDIATE`
+    /// transaction -- unlike a separate select-then-delete, this closes
+    /// the cross-process race where two separate OS processes' `record()`
+    /// calls could otherwise both select overlapping candidates and
+    /// double-evict, or one process could delete a row a moment after
+    /// another process refreshed it via `confirm_hit`/`insert`. Returns
+    /// the removed rows so the caller can delete their backing files
+    /// afterward (outside this transaction -- a crash between commit and
+    /// file deletion leaves only a harmless orphaned file, never a
+    /// dangling manifest row, since the row is already gone by then).
+    pub(crate) async fn evict_and_remove(
+        &self,
+        target_bytes: u64,
+    ) -> Result<Vec<ManifestRow>, KvCacheError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| KvCacheError::Backend(e.to_string()))?;
+
+        let rows: Vec<ManifestRow> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT backend_id, model_id, build_hash, prefix_hash, handle, size_bytes, token_count, last_used_at_nanos, hit_count
+                     FROM slots ORDER BY last_used_at_nanos ASC, rowid ASC",
+                )
+                .map_err(|e| KvCacheError::Backend(e.to_string()))?;
+            stmt.query_map([], row_from_sql)
+                .map_err(|e| KvCacheError::Backend(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| KvCacheError::Backend(e.to_string()))?
+        };
+
+        let mut total: u64 = rows.iter().map(|r| r.size_bytes).sum();
+        let mut removed = Vec::new();
+        for row in rows {
+            if total <= target_bytes {
+                break;
+            }
+            total = total.saturating_sub(row.size_bytes);
+            tx.execute(
+                "DELETE FROM slots WHERE backend_id = ?1 AND model_id = ?2 AND build_hash = ?3 AND prefix_hash = ?4",
+                params![
+                    row.key.backend_id,
+                    row.key.model_id,
+                    row.key.build_hash,
+                    row.key.prefix_hash
+                ],
+            )
+            .map_err(|e| KvCacheError::Backend(e.to_string()))?;
+            removed.push(row);
+        }
+
+        tx.commit()
+            .map_err(|e| KvCacheError::Backend(e.to_string()))?;
+        Ok(removed)
     }
 
     pub(crate) async fn total_bytes(&self) -> Result<u64, KvCacheError> {
@@ -183,27 +247,13 @@ impl Manifest {
         let conn = self.conn.lock().await;
         let sql = format!(
             "SELECT backend_id, model_id, build_hash, prefix_hash, handle, size_bytes, token_count, last_used_at_nanos, hit_count
-             FROM slots ORDER BY last_used_at_nanos {order}"
+             FROM slots ORDER BY last_used_at_nanos {order}, rowid {order}"
         );
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(ManifestRow {
-                    key: CacheKey {
-                        backend_id: row.get(0)?,
-                        model_id: row.get(1)?,
-                        build_hash: row.get(2)?,
-                        prefix_hash: row.get(3)?,
-                    },
-                    handle: CacheHandle::new(row.get::<_, String>(4)?),
-                    size_bytes: row.get::<_, i64>(5)? as u64,
-                    token_count: row.get::<_, i64>(6)? as u64,
-                    last_used_at_secs: nanos_to_secs(row.get::<_, i64>(7)?),
-                    hit_count: row.get::<_, i64>(8)? as u64,
-                })
-            })
+            .query_map([], row_from_sql)
             .map_err(|e| KvCacheError::Backend(e.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
@@ -238,6 +288,22 @@ fn now_nanos() -> i64 {
 
 fn nanos_to_secs(nanos: i64) -> u64 {
     (nanos as u64) / 1_000_000_000
+}
+
+fn row_from_sql(row: &Row) -> rusqlite::Result<ManifestRow> {
+    Ok(ManifestRow {
+        key: CacheKey {
+            backend_id: row.get(0)?,
+            model_id: row.get(1)?,
+            build_hash: row.get(2)?,
+            prefix_hash: row.get(3)?,
+        },
+        handle: CacheHandle::new(row.get::<_, String>(4)?),
+        size_bytes: row.get::<_, i64>(5)? as u64,
+        token_count: row.get::<_, i64>(6)? as u64,
+        last_used_at_secs: nanos_to_secs(row.get::<_, i64>(7)?),
+        hit_count: row.get::<_, i64>(8)? as u64,
+    })
 }
 
 #[cfg(test)]
@@ -357,6 +423,36 @@ mod tests {
 
         // evict_candidates itself doesn't remove anything.
         assert_eq!(m.total_bytes().await.unwrap(), 300);
+    }
+
+    #[tokio::test]
+    async fn evict_and_remove_atomically_removes_lru_rows_until_under_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Manifest::open(&dir.path().join("manifest.db")).unwrap();
+
+        for p in ["p1", "p2", "p3"] {
+            m.insert(
+                &key(p),
+                &CacheHandle::new(format!("{p}.slot")),
+                CacheMeta {
+                    size_bytes: 100,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        m.confirm_hit(&key("p1")).await.unwrap();
+
+        let removed = m.evict_and_remove(150).await.unwrap();
+        let removed_hashes: Vec<&str> =
+            removed.iter().map(|r| r.key.prefix_hash.as_str()).collect();
+        assert_eq!(removed_hashes, vec!["p2", "p3"]);
+
+        // Unlike evict_candidates, this actually removed the rows.
+        assert_eq!(m.total_bytes().await.unwrap(), 100);
+        assert!(m.find(&key("p1")).await.unwrap().is_some());
+        assert!(m.find(&key("p2")).await.unwrap().is_none());
     }
 
     #[tokio::test]
