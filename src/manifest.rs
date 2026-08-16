@@ -180,13 +180,8 @@ impl Manifest {
                 .map_err(|e| KvCacheError::Backend(e.to_string()))?
         };
 
-        let mut total: u64 = rows.iter().map(|r| r.size_bytes).sum();
-        let mut removed = Vec::new();
-        for row in rows {
-            if total <= target_bytes {
-                break;
-            }
-            total = total.saturating_sub(row.size_bytes);
+        let candidates = select_eviction_candidates(rows, target_bytes);
+        for row in &candidates {
             tx.execute(
                 "DELETE FROM slots WHERE backend_id = ?1 AND model_id = ?2 AND build_hash = ?3 AND prefix_hash = ?4",
                 params![
@@ -197,12 +192,11 @@ impl Manifest {
                 ],
             )
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
-            removed.push(row);
         }
 
         tx.commit()
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
-        Ok(removed)
+        Ok(candidates)
     }
 
     pub(crate) async fn total_bytes(&self) -> Result<u64, KvCacheError> {
@@ -226,16 +220,7 @@ impl Manifest {
         target_bytes: u64,
     ) -> Result<Vec<ManifestRow>, KvCacheError> {
         let rows = self.all_rows("ASC").await?;
-        let mut total: u64 = rows.iter().map(|r| r.size_bytes).sum();
-        let mut candidates = Vec::new();
-        for row in rows {
-            if total <= target_bytes {
-                break;
-            }
-            total = total.saturating_sub(row.size_bytes);
-            candidates.push(row);
-        }
-        Ok(candidates)
+        Ok(select_eviction_candidates(rows, target_bytes))
     }
 
     /// Every row, most-recently-used first — for the CLI's `list`.
@@ -259,6 +244,24 @@ impl Manifest {
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
         Ok(rows)
     }
+}
+
+/// Given `rows` sorted least-recently-used first, selects candidates
+/// (also least-recently-used first) to evict until the running total is
+/// at or under `target_bytes`. Pure, no I/O -- shared by `evict_candidates`
+/// (read-only) and `evict_and_remove` (which also deletes them), so the
+/// two can never disagree about *which* rows a given budget selects.
+fn select_eviction_candidates(rows: Vec<ManifestRow>, target_bytes: u64) -> Vec<ManifestRow> {
+    let mut total: u64 = rows.iter().map(|r| r.size_bytes).sum();
+    let mut candidates = Vec::new();
+    for row in rows {
+        if total <= target_bytes {
+            break;
+        }
+        total = total.saturating_sub(row.size_bytes);
+        candidates.push(row);
+    }
+    candidates
 }
 
 fn now_secs() -> i64 {
