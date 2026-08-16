@@ -1,7 +1,8 @@
 //! Shared behavior contract, run against every `KvCacheStore`
 //! implementation in this crate. See `KvCacheStore`'s own doc comment for
 //! what's being asserted here. `max_bytes` must match whatever budget the
-//! `store` under test was actually configured with.
+//! `store` under test was actually configured with, and must be at least
+//! 200 (see `assert_conformance`'s doc comment for why).
 
 use crate::{CacheHandle, CacheKey, CacheMeta, KvCacheError, KvCacheStore};
 
@@ -14,6 +15,9 @@ fn key(prefix: &str) -> CacheKey {
     }
 }
 
+/// `max_bytes` must be at least 200: the LRU-eviction section below records
+/// two 100-byte entries that must both fit before a third entry forces
+/// eviction of exactly one of them.
 pub(crate) async fn assert_conformance(store: &dyn KvCacheStore, max_bytes: u64) {
     // Nothing recorded yet: find is None, eviction is a no-op.
     assert!(store.find(&key("p1")).await.unwrap().is_none());
@@ -50,10 +54,10 @@ pub(crate) async fn assert_conformance(store: &dyn KvCacheStore, max_bytes: u64)
     assert!(matches!(err, KvCacheError::SlotExceedsBudget { .. }));
     assert!(store.find(&key("too-big")).await.unwrap().is_none());
 
-    // Eviction removes least-recently-used entries first once over budget.
-    // p1 already recorded (100 bytes); confirm_hit it so it's more recently
-    // used than what follows.
-    store.confirm_hit(&key("p1")).await.unwrap();
+    // LRU eviction: confirm_hit moves recency, find() alone does not.
+    // p1 already exists (recorded above, 100 bytes). Record p2, another
+    // 100-byte entry -- naturally more recently used than p1 since it's
+    // recorded after.
     store
         .record(
             &key("p2"),
@@ -65,24 +69,45 @@ pub(crate) async fn assert_conformance(store: &dyn KvCacheStore, max_bytes: u64)
         )
         .await
         .unwrap();
-    // Recording p2 already ran an opportunistic eviction pass; both p1 and p2
-    // together (200 bytes) may or may not exceed max_bytes depending on the
-    // caller's configured budget, so callers of this suite should configure
-    // `store` with a budget of at least 250 bytes for this section to be
-    // meaningful. Push total over budget explicitly to force eviction:
+
+    // Reverse the natural order: confirm_hit(p1) makes p1 the more recently
+    // used of the two, even though p2 was recorded after it. If this were a
+    // no-op, p1 would remain the older entry and the eviction below would
+    // pick it instead of p2.
+    store.confirm_hit(&key("p1")).await.unwrap();
+
+    // find() alone must not affect recency -- call it repeatedly on p2 and
+    // confirm below that it still gets evicted, proving find() didn't
+    // protect it. If find() incorrectly bumped recency, p2 would survive
+    // the eviction below instead of p1.
+    for _ in 0..3 {
+        store.find(&key("p2")).await.unwrap();
+    }
+
+    // Force eviction of exactly one 100-byte entry: recording an entry
+    // sized (max_bytes - 100) brings the total to max_bytes + 100 -- 100
+    // bytes over budget, just enough to require evicting exactly one of
+    // p1/p2, so the eviction decision is fully determined by which of the
+    // two is actually least-recently-used.
     store
         .record(
             &key("p3"),
             CacheHandle::new("p3.slot"),
             CacheMeta {
-                size_bytes: max_bytes,
+                size_bytes: max_bytes - 100,
                 token_count: 1,
             },
         )
         .await
         .unwrap();
-    // p3 alone is at the budget; p1 and p2 (the least-recently-used entries)
-    // must have been evicted to make room.
+
+    // If confirm_hit and find behaved correctly, p2 (the true LRU entry)
+    // was evicted; p1 (confirm_hit'd) and p3 (just recorded) both survive.
+    // A confirm_hit that silently no-ops, or a find() that wrongly bumps
+    // recency, would instead evict p1 here -- these assertions actually
+    // distinguish correct from broken behavior, unlike the previous
+    // version of this section.
+    assert!(store.find(&key("p1")).await.unwrap().is_some());
     assert!(store.find(&key("p3")).await.unwrap().is_some());
     assert!(store.find(&key("p2")).await.unwrap().is_none());
 }
