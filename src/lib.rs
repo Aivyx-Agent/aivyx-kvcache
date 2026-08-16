@@ -10,6 +10,9 @@ mod manifest;
 mod in_memory;
 pub use in_memory::InMemoryKvCacheStore;
 
+mod llama_server;
+pub use llama_server::LlamaServerSlotStore;
+
 #[cfg(test)]
 mod conformance;
 
