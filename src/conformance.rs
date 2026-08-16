@@ -19,6 +19,11 @@ fn key(prefix: &str) -> CacheKey {
 /// two 100-byte entries that must both fit before a third entry forces
 /// eviction of exactly one of them.
 pub(crate) async fn assert_conformance(store: &dyn KvCacheStore, max_bytes: u64) {
+    assert!(
+        max_bytes >= 200,
+        "assert_conformance requires max_bytes >= 200 (the LRU-eviction section needs room for two 100-byte entries before forcing eviction), got {max_bytes}"
+    );
+
     // Nothing recorded yet: find is None, eviction is a no-op.
     assert!(store.find(&key("p1")).await.unwrap().is_none());
     let report = store.evict_to_budget().await.unwrap();

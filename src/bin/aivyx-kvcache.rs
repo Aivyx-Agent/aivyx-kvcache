@@ -27,7 +27,7 @@ enum Command {
     /// Evict entries down to (at most) a target byte count.
     Prune {
         /// Evict until total bytes are at or under this value.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long)]
         to: u64,
         /// Report what would be evicted without deleting anything.
         #[arg(long)]

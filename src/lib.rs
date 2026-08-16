@@ -1,6 +1,6 @@
 //! Backend-agnostic KV-cache persistence/sharing layer for local LLM
-//! serving. See `KvCacheStore`'s own doc comment (added in a later
-//! commit) for the contract every implementation must satisfy.
+//! serving. See `KvCacheStore`'s own doc comment for the contract every
+//! implementation must satisfy.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -65,6 +65,7 @@ pub struct EvictionReport {
 
 /// Errors a `KvCacheStore` can return.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum KvCacheError {
     #[error(
         "kvcache slot of {size_bytes} bytes exceeds the configured budget of {max_bytes} bytes"
