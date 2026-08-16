@@ -13,6 +13,8 @@ pub use in_memory::InMemoryKvCacheStore;
 mod llama_server;
 pub use llama_server::LlamaServerSlotStore;
 
+pub mod cli;
+
 #[cfg(test)]
 mod conformance;
 
