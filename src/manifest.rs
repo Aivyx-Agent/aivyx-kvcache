@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::Mutex;
 
 use crate::{CacheHandle, CacheKey, CacheMeta, KvCacheError};
@@ -84,7 +84,13 @@ impl Manifest {
         conn.execute(
             "UPDATE slots SET hit_count = hit_count + 1, last_used_at_nanos = ?5
              WHERE backend_id = ?1 AND model_id = ?2 AND build_hash = ?3 AND prefix_hash = ?4",
-            params![key.backend_id, key.model_id, key.build_hash, key.prefix_hash, now],
+            params![
+                key.backend_id,
+                key.model_id,
+                key.build_hash,
+                key.prefix_hash,
+                now
+            ],
         )
         .map_err(|e| KvCacheError::Backend(e.to_string()))?;
         Ok(())
@@ -138,9 +144,11 @@ impl Manifest {
     pub(crate) async fn total_bytes(&self) -> Result<u64, KvCacheError> {
         let conn = self.conn.lock().await;
         let total: i64 = conn
-            .query_row("SELECT COALESCE(SUM(size_bytes), 0) FROM slots", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM slots",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
         Ok(total as u64)
     }
@@ -177,7 +185,9 @@ impl Manifest {
             "SELECT backend_id, model_id, build_hash, prefix_hash, handle, size_bytes, token_count, last_used_at_nanos, hit_count
              FROM slots ORDER BY last_used_at_nanos {order}"
         );
-        let mut stmt = conn.prepare(&sql).map_err(|e| KvCacheError::Backend(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| KvCacheError::Backend(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(ManifestRow {
@@ -339,7 +349,10 @@ mod tests {
         // Total is 300; budget of 150 must evict until <= 150, i.e. evict
         // p2 then p3 (p2 is LRU, p3 is next), leaving only p1 (100 <= 150).
         let candidates = m.evict_candidates(150).await.unwrap();
-        let evicted: Vec<&str> = candidates.iter().map(|r| r.key.prefix_hash.as_str()).collect();
+        let evicted: Vec<&str> = candidates
+            .iter()
+            .map(|r| r.key.prefix_hash.as_str())
+            .collect();
         assert_eq!(evicted, vec!["p2", "p3"]);
 
         // evict_candidates itself doesn't remove anything.

@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use crate::manifest::Manifest;
 use crate::KvCacheError;
+use crate::manifest::Manifest;
 
 pub async fn list_slots(store_path: &Path) -> Result<String, KvCacheError> {
     let manifest = Manifest::open(&store_path.join("manifest.db"))?;
@@ -13,7 +13,11 @@ pub async fn list_slots(store_path: &Path) -> Result<String, KvCacheError> {
     for row in rows {
         out.push_str(&format!(
             "{:<15} {:<16} {:<9} {:<5} {}\n",
-            row.key.model_id, row.key.backend_id, row.size_bytes, row.hit_count, row.last_used_at_secs
+            row.key.model_id,
+            row.key.backend_id,
+            row.size_bytes,
+            row.hit_count,
+            row.last_used_at_secs
         ));
     }
     Ok(out)
@@ -30,7 +34,11 @@ pub async fn stats(store_path: &Path, max_bytes: u64) -> Result<String, KvCacheE
     ))
 }
 
-pub async fn prune(store_path: &Path, target_bytes: u64, dry_run: bool) -> Result<String, KvCacheError> {
+pub async fn prune(
+    store_path: &Path,
+    target_bytes: u64,
+    dry_run: bool,
+) -> Result<String, KvCacheError> {
     let manifest = Manifest::open(&store_path.join("manifest.db"))?;
     let candidates = manifest.evict_candidates(target_bytes).await?;
     if dry_run {

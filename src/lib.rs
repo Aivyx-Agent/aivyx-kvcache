@@ -66,7 +66,9 @@ pub struct EvictionReport {
 /// Errors a `KvCacheStore` can return.
 #[derive(Debug, Error)]
 pub enum KvCacheError {
-    #[error("kvcache slot of {size_bytes} bytes exceeds the configured budget of {max_bytes} bytes")]
+    #[error(
+        "kvcache slot of {size_bytes} bytes exceeds the configured budget of {max_bytes} bytes"
+    )]
     SlotExceedsBudget { size_bytes: u64, max_bytes: u64 },
     #[error("kvcache backend error: {0}")]
     Backend(String),

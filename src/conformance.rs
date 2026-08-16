@@ -34,7 +34,10 @@ pub(crate) async fn assert_conformance(store: &dyn KvCacheStore, max_bytes: u64)
         size_bytes: 100,
         token_count: 10,
     };
-    store.record(&key("p1"), handle.clone(), meta).await.unwrap();
+    store
+        .record(&key("p1"), handle.clone(), meta)
+        .await
+        .unwrap();
     assert_eq!(store.find(&key("p1")).await.unwrap(), Some(handle));
 
     // find never has side effects: hit_count/recency only move via confirm_hit.

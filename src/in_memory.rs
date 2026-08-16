@@ -42,7 +42,12 @@ impl InMemoryKvCacheStore {
 #[async_trait]
 impl KvCacheStore for InMemoryKvCacheStore {
     async fn find(&self, key: &CacheKey) -> Result<Option<CacheHandle>, KvCacheError> {
-        Ok(self.entries.lock().unwrap().get(key).map(|e| e.handle.clone()))
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|e| e.handle.clone()))
     }
 
     async fn confirm_hit(&self, key: &CacheKey) -> Result<(), KvCacheError> {

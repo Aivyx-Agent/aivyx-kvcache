@@ -54,7 +54,11 @@ impl LlamaServerSlotStore {
     /// contract). Never returns an `Err` for a cache miss or a failed
     /// restore: those are expected outcomes the caller falls back from by
     /// sending a normal cold request, not failures of the turn itself.
-    pub async fn restore_into_slot(&self, key: &CacheKey, slot_id: u32) -> Result<bool, KvCacheError> {
+    pub async fn restore_into_slot(
+        &self,
+        key: &CacheKey,
+        slot_id: u32,
+    ) -> Result<bool, KvCacheError> {
         let Some(handle) = self.find(key).await? else {
             return Ok(false);
         };
@@ -218,7 +222,10 @@ mod tests {
             .unwrap();
 
         assert!(store.find(&k).await.unwrap().is_none());
-        assert!(!path.exists(), "evicted slot's file must be deleted from disk");
+        assert!(
+            !path.exists(),
+            "evicted slot's file must be deleted from disk"
+        );
     }
 
     #[tokio::test]
@@ -230,7 +237,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LlamaServerSlotStore::open(dir.path(), server.uri(), 1_000).unwrap();
 
-        let restored = store.restore_into_slot(&key("never-recorded"), 0).await.unwrap();
+        let restored = store
+            .restore_into_slot(&key("never-recorded"), 0)
+            .await
+            .unwrap();
         assert!(!restored);
     }
 
