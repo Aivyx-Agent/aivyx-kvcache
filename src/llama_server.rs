@@ -197,7 +197,33 @@ impl LlamaServerSlotStore {
             .map_err(|e| KvCacheError::Backend(e.to_string()))?
             .error_for_status()
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
-        self.record(key, CacheHandle::new(filename), meta).await
+
+        // llama-server just wrote the real file to disk -- measure it
+        // rather than trust the caller's meta.size_bytes, which is often a
+        // rough estimate or placeholder (see docs/superpowers/specs/
+        // 2026-08-16-real-llama-server-e2e-test-design.md's own "known
+        // limitation" note: a caller that under-reports size_bytes
+        // silently defeats evict_to_budget's whole accounting). A stat
+        // failure (e.g. a test harness that mocks the HTTP call without
+        // writing a real file) falls back to the caller-supplied size
+        // rather than failing the save outright.
+        let path = self.slots_dir.join(&filename);
+        let real_meta = match std::fs::metadata(&path) {
+            Ok(fs_meta) => CacheMeta { size_bytes: fs_meta.len(), token_count: meta.token_count },
+            Err(_) => meta,
+        };
+
+        let handle = CacheHandle::new(filename);
+        if let Err(err) = self.record(key, handle, real_meta).await {
+            // record() rejected the *real* size as over budget even though
+            // the caller's own estimate passed the pre-check above --
+            // llama-server already wrote the file, so clean up the orphan
+            // rather than leave a file on disk the manifest never learns
+            // about.
+            let _ = std::fs::remove_file(&path);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -498,5 +524,113 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KvCacheError::SlotExceedsBudget { .. }));
+    }
+
+    #[tokio::test]
+    async fn save_from_slot_uses_the_real_file_size_not_the_caller_supplied_placeholder() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/slots/0$"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Budget is exactly key1's real size -- key1 alone fits, but
+        // key1 + key2 together don't, forcing eviction once key2 lands.
+        let store = LlamaServerSlotStore::open(dir.path(), server.uri(), 5_000).unwrap();
+
+        let k1 = key("p1");
+        // Simulate llama-server having written the real file BEFORE our
+        // mock HTTP response returns -- wiremock itself never writes real
+        // files, so pre-stage it at the exact path save_from_slot expects.
+        std::fs::write(store.slot_path(&k1), vec![0u8; 5_000]).unwrap();
+
+        // Caller passes a wildly wrong placeholder (1 byte, matching the
+        // real-world caller this bug was found in). If the fix works, the
+        // manifest records the real 5,000-byte size instead.
+        store
+            .save_from_slot(&k1, 0, CacheMeta { size_bytes: 1, token_count: 1 })
+            .await
+            .unwrap();
+
+        let k2 = key("p2");
+        std::fs::write(store.slot_path(&k2), vec![0u8; 100]).unwrap();
+        store
+            .record(
+                &k2,
+                CacheHandle::new(slot_filename(&k2)),
+                CacheMeta { size_bytes: 100, token_count: 1 },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store.find(&k1).await.unwrap().is_none(),
+            "key1 must have been evicted once its REAL ~5,000-byte size pushed the store over \
+             its 5,000-byte budget alongside key2's 100 bytes -- if the placeholder \
+             size_bytes=1 were still being used, key1+key2 would total only 101 bytes and \
+             neither would evict"
+        );
+        assert!(store.find(&k2).await.unwrap().is_some(), "key2 must still be present");
+    }
+
+    #[tokio::test]
+    async fn save_from_slot_falls_back_to_the_caller_supplied_size_when_no_real_file_exists() {
+        // No file written at the slot path -- exactly what every OTHER
+        // wiremock-based test in this module already does (they assert
+        // success without ever writing a real file). This proves the fix
+        // doesn't break every pre-existing test's own implicit assumption.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/slots/0$"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = LlamaServerSlotStore::open(dir.path(), server.uri(), 1_000).unwrap();
+
+        store
+            .save_from_slot(&key("p1"), 0, CacheMeta { size_bytes: 10, token_count: 1 })
+            .await
+            .unwrap();
+
+        assert!(store.find(&key("p1")).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn save_from_slot_deletes_the_orphaned_file_when_the_real_size_exceeds_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/slots/0$"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // max_bytes is large enough that the caller's placeholder (1 byte)
+        // passes the pre-check, but smaller than the real file that turns
+        // out to exist on disk once the save "completes".
+        let store = LlamaServerSlotStore::open(dir.path(), server.uri(), 100).unwrap();
+
+        let k1 = key("p1");
+        let path = store.slot_path(&k1);
+        std::fs::write(&path, vec![0u8; 5_000]).unwrap();
+
+        let err = store
+            .save_from_slot(&k1, 0, CacheMeta { size_bytes: 1, token_count: 1 })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KvCacheError::SlotExceedsBudget { .. }));
+        assert!(
+            !path.exists(),
+            "the orphaned file llama-server already wrote must be cleaned up when the real \
+             size turns out to exceed budget"
+        );
+        assert!(
+            store.find(&k1).await.unwrap().is_none(),
+            "no manifest entry should exist for a save that was ultimately rejected"
+        );
     }
 }
