@@ -1,9 +1,24 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::manifest::Manifest;
 use crate::{CacheHandle, CacheKey, CacheMeta, EvictionReport, KvCacheError, KvCacheStore};
+
+/// Per-request timeout for every call this store's `http` client makes
+/// (`restore_into_slot`/`save_from_slot`, both driven through the same
+/// client). Deliberately much larger than a lightweight JSON-probe
+/// timeout (e.g. aivyx-coder's own 3s `/props` probe) -- a save/restore
+/// transfers the actual KV-cache slot contents, which this crate's own
+/// README documents as "headroom for multi-GB caches at long context
+/// windows", so a bound tuned for a tiny status check would spuriously
+/// fail large, otherwise-healthy transfers. Still finite: without this,
+/// `ensure_kv_slot_checked_out` (aivyx-coder) runs this on the hot path
+/// of every turn, before the turn's own cancellation check, so a wedged
+/// llama-server connection previously hung every subsequent turn
+/// indefinitely rather than falling back to an unpinned/cold session.
+const SLOT_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The real, llama-server-backed `KvCacheStore`. Drives llama-server's
 /// native `/slots/{id}?action=save|restore` API (see `restore_into_slot`/
@@ -92,16 +107,41 @@ impl LlamaServerSlotStore {
         base_url: impl Into<String>,
         max_bytes: u64,
     ) -> Result<Self, KvCacheError> {
+        Self::open_with_http_timeout(store_path, base_url, max_bytes, SLOT_HTTP_TIMEOUT)
+    }
+
+    /// Same as `open`, but with the `http` client's per-request timeout
+    /// as an explicit parameter rather than the fixed `SLOT_HTTP_TIMEOUT`
+    /// constant -- exists so tests can exercise the exact same
+    /// client-construction path with a short timeout instead of waiting
+    /// out the real (deliberately generous, for multi-GB transfers)
+    /// production value. Not part of the public API: `open` is the only
+    /// real caller outside this module's own tests.
+    fn open_with_http_timeout(
+        store_path: impl Into<PathBuf>,
+        base_url: impl Into<String>,
+        max_bytes: u64,
+        http_timeout: Duration,
+    ) -> Result<Self, KvCacheError> {
         let store_path = store_path.into();
         let manifest = Manifest::open(&store_path.join("manifest.db"))?;
         let slots_dir = store_path.join("slots");
         std::fs::create_dir_all(&slots_dir).map_err(|e| KvCacheError::Backend(e.to_string()))?;
+        // `.build()` only fails on TLS/resolver init issues -- surfaced
+        // as a real `Err` here (unlike the previous infallible
+        // `reqwest::Client::new()`, itself just `.build().expect(..)`)
+        // since a caller opening a store deserves to see that rather
+        // than a panic.
+        let http = reqwest::Client::builder()
+            .timeout(http_timeout)
+            .build()
+            .map_err(|e| KvCacheError::Backend(e.to_string()))?;
         Ok(Self {
             manifest,
             slots_dir,
             max_bytes,
             base_url: base_url.into(),
-            http: reqwest::Client::new(),
+            http,
         })
     }
 
@@ -632,5 +672,73 @@ mod tests {
             store.find(&k1).await.unwrap().is_none(),
             "no manifest entry should exist for a save that was ultimately rejected"
         );
+    }
+
+    /// Regression test for the backlog item closing this store's own
+    /// unbounded-hang class: `http` previously had no per-request timeout
+    /// at all (`reqwest::Client::new()`), so a wedged llama-server
+    /// connection hung `restore_into_slot`/`save_from_slot` forever --
+    /// and since aivyx-coder's `ensure_kv_slot_checked_out` runs this on
+    /// the hot path of every turn, before that turn's own cancellation
+    /// check, a single hang there wedged every subsequent turn too. Uses
+    /// `open_with_http_timeout` (not the real `SLOT_HTTP_TIMEOUT`, which
+    /// is deliberately generous for multi-GB real transfers) so this
+    /// stays fast: the mocked restore response delays for 2s, well past
+    /// the short 150ms timeout under test, and the outer 1.5s
+    /// `tokio::time::timeout` exists only as a safety bound so a
+    /// regression here fails this test loudly instead of hanging the
+    /// suite for the full 2s mock delay.
+    #[tokio::test]
+    async fn restore_into_slot_does_not_hang_against_an_unresponsive_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/slots/0$"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = LlamaServerSlotStore::open_with_http_timeout(
+            dir.path(),
+            server.uri(),
+            1_000,
+            Duration::from_millis(150),
+        )
+        .unwrap();
+        store
+            .record(&key("p1"), CacheHandle::new("p1.slot"), CacheMeta { size_bytes: 10, token_count: 1 })
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(1_500), store.restore_into_slot(&key("p1"), 0))
+                .await;
+
+        match outcome {
+            Ok(inner) => {
+                // A timed-out HTTP call is a caught, expected failure mode
+                // inside restore_into_slot (same as any other backend
+                // error) -- it falls back to `Ok(false)`, not a raw `Err`;
+                // see its own doc comment. The real signal that the
+                // client's own timeout (not this test's outer safety net)
+                // is what fired is the elapsed time below.
+                assert_eq!(
+                    inner.unwrap(),
+                    false,
+                    "a timed-out restore must fall back to a miss, not a confirmed hit"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_millis(1_000),
+                    "the client's own 150ms timeout should have fired well before this outer \
+                     safety bound; took {:?}",
+                    started.elapsed()
+                );
+            }
+            Err(_) => panic!(
+                "the client had no working timeout of its own -- the outer 1.5s safety bound \
+                 fired instead of the configured 150ms timeout"
+            ),
+        }
     }
 }
