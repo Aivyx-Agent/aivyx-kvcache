@@ -148,6 +148,19 @@ async fn real_llama_server_save_restore_evict_round_trip() {
         1,
         "expected exactly one file in slots/ after one save"
     );
+    // The caller-supplied `size_bytes: 100` above is a throwaway estimate --
+    // `save_from_slot` measures and records the REAL file size instead (see
+    // its own doc comment in `src/llama_server.rs`), which for a real model
+    // is many megabytes, not 100 bytes. Capture that real size here so the
+    // tighter budget below is sized off reality rather than a hardcoded
+    // guess -- a hardcoded byte count (this test used to use `150`) stops
+    // meaning anything the moment real-size measurement is in play: no real
+    // slot file can ever fit under a handful of bytes, so eviction would
+    // never even get exercised, and the save would just fail outright.
+    let key1_real_size = entries[0]
+        .metadata()
+        .expect("failed to stat key1's real slot file")
+        .len();
 
     // Step 3: real restore -- a genuine successful round-trip against real
     // llama-server, not a mocked 200.
@@ -175,7 +188,11 @@ async fn real_llama_server_save_restore_evict_round_trip() {
         .error_for_status()
         .expect("second completion request returned an error status");
 
-    let evicting_store = LlamaServerSlotStore::open(store_path, &base_url, 150)
+    // 1.5x key1's real size: comfortably fits key1 alone, but key1 + a
+    // similarly-sized key2 (same model/slot/prompt shape) together exceed
+    // it, forcing eviction -- the actual thing this step means to test.
+    let tighter_budget = key1_real_size + key1_real_size / 2;
+    let evicting_store = LlamaServerSlotStore::open(store_path, &base_url, tighter_budget)
         .expect("failed to open a second LlamaServerSlotStore with a tighter budget");
     let key2 = key(&model_path, "e2e-prefix-2");
     evicting_store
@@ -189,7 +206,7 @@ async fn real_llama_server_save_restore_evict_round_trip() {
             .await
             .expect("find(key1) failed")
             .is_none(),
-        "key1 must have been evicted once key1+key2 exceeded the 150-byte budget"
+        "key1 must have been evicted once key1+key2 exceeded the tighter budget"
     );
     assert!(
         evicting_store

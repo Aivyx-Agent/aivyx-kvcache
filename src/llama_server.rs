@@ -723,9 +723,8 @@ mod tests {
                 // see its own doc comment. The real signal that the
                 // client's own timeout (not this test's outer safety net)
                 // is what fired is the elapsed time below.
-                assert_eq!(
-                    inner.unwrap(),
-                    false,
+                assert!(
+                    !inner.unwrap(),
                     "a timed-out restore must fall back to a miss, not a confirmed hit"
                 );
                 assert!(
