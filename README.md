@@ -26,11 +26,16 @@ disk, headroom for multi-GB caches at long context windows, and
 survival across an OS reinstall are all deliberate goals, not just
 config flexibility.
 
-Not yet consumed by either `aivyx-coder` or `aivyx` — integrating this
-crate into each app's own `aivyx-llm` is separate, explicit follow-on
-work, not an automatic consequence of this crate existing (the sibling
-`aivyx-recall` crate has direct history here: it was built the same way
-and `aivyx`'s own memory crate never actually migrated onto it).
+**Adopted by both real consumers.** `aivyx-coder`'s adoption shipped
+2026-08-21; `aivyx`'s own shipped 2026-08-22 (architecturally different
+from `aivyx-coder`'s — `aivyx` builds a fresh `LlmPlanner` every turn, so
+`KvSlotPool` tracks each slot's currently-loaded prefix in-process to
+avoid clobbering live conversation state on a later turn). Both integrate
+via each app's own `aivyx-llm` crate. The sibling `aivyx-recall` crate's
+own history (built standalone, never actually adopted by `aivyx`'s memory
+crate) is why this crate shipped the same cautious way — that caution
+turned out unnecessary here, but the design choice to ship without an
+assumed consumer was still the right call at the time.
 
 See `docs/superpowers/specs/2026-08-16-aivyx-kvcache-design.md` in the
 `aivyx-ecosystem` repo for the full design rationale.

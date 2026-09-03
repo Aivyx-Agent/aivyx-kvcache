@@ -17,8 +17,12 @@ otherwise-separate llama-server processes. See `README.md` and
 for the full rationale — this file only covers what's specific to
 working in this repo's code.
 
-Neither `aivyx-coder` nor `aivyx` actually depends on this crate yet;
-that integration is separate follow-on work, tracked outside this repo.
+**Both `aivyx-coder` and `aivyx` depend on this crate.** `aivyx-coder`'s
+adoption shipped 2026-08-21, `aivyx`'s shipped 2026-08-22 — see
+`aivyx-ecosystem/ROADMAP.md`'s `aivyx-kvcache` entry for the full account
+of both (including a real multi-turn-session bug `aivyx`'s own final
+review caught, fixed by giving `KvSlotPool` its own in-process tracking
+of which prefix each slot currently, physically holds).
 
 ## Build, test, lint
 
