@@ -249,7 +249,10 @@ impl LlamaServerSlotStore {
         // rather than failing the save outright.
         let path = self.slots_dir.join(&filename);
         let real_meta = match std::fs::metadata(&path) {
-            Ok(fs_meta) => CacheMeta { size_bytes: fs_meta.len(), token_count: meta.token_count },
+            Ok(fs_meta) => CacheMeta {
+                size_bytes: fs_meta.len(),
+                token_count: meta.token_count,
+            },
             Err(_) => meta,
         };
 
@@ -590,7 +593,14 @@ mod tests {
         // real-world caller this bug was found in). If the fix works, the
         // manifest records the real 5,000-byte size instead.
         store
-            .save_from_slot(&k1, 0, CacheMeta { size_bytes: 1, token_count: 1 })
+            .save_from_slot(
+                &k1,
+                0,
+                CacheMeta {
+                    size_bytes: 1,
+                    token_count: 1,
+                },
+            )
             .await
             .unwrap();
 
@@ -600,7 +610,10 @@ mod tests {
             .record(
                 &k2,
                 CacheHandle::new(slot_filename(&k2)),
-                CacheMeta { size_bytes: 100, token_count: 1 },
+                CacheMeta {
+                    size_bytes: 100,
+                    token_count: 1,
+                },
             )
             .await
             .unwrap();
@@ -612,7 +625,10 @@ mod tests {
              size_bytes=1 were still being used, key1+key2 would total only 101 bytes and \
              neither would evict"
         );
-        assert!(store.find(&k2).await.unwrap().is_some(), "key2 must still be present");
+        assert!(
+            store.find(&k2).await.unwrap().is_some(),
+            "key2 must still be present"
+        );
     }
 
     #[tokio::test]
@@ -632,7 +648,14 @@ mod tests {
         let store = LlamaServerSlotStore::open(dir.path(), server.uri(), 1_000).unwrap();
 
         store
-            .save_from_slot(&key("p1"), 0, CacheMeta { size_bytes: 10, token_count: 1 })
+            .save_from_slot(
+                &key("p1"),
+                0,
+                CacheMeta {
+                    size_bytes: 10,
+                    token_count: 1,
+                },
+            )
             .await
             .unwrap();
 
@@ -659,7 +682,14 @@ mod tests {
         std::fs::write(&path, vec![0u8; 5_000]).unwrap();
 
         let err = store
-            .save_from_slot(&k1, 0, CacheMeta { size_bytes: 1, token_count: 1 })
+            .save_from_slot(
+                &k1,
+                0,
+                CacheMeta {
+                    size_bytes: 1,
+                    token_count: 1,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, KvCacheError::SlotExceedsBudget { .. }));
@@ -706,14 +736,23 @@ mod tests {
         )
         .unwrap();
         store
-            .record(&key("p1"), CacheHandle::new("p1.slot"), CacheMeta { size_bytes: 10, token_count: 1 })
+            .record(
+                &key("p1"),
+                CacheHandle::new("p1.slot"),
+                CacheMeta {
+                    size_bytes: 10,
+                    token_count: 1,
+                },
+            )
             .await
             .unwrap();
 
         let started = std::time::Instant::now();
-        let outcome =
-            tokio::time::timeout(Duration::from_millis(1_500), store.restore_into_slot(&key("p1"), 0))
-                .await;
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            store.restore_into_slot(&key("p1"), 0),
+        )
+        .await;
 
         match outcome {
             Ok(inner) => {

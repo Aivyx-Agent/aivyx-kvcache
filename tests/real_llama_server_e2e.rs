@@ -136,7 +136,14 @@ async fn real_llama_server_save_restore_evict_round_trip() {
 
     // Step 2: real save.
     store
-        .save_from_slot(&key1, 0, CacheMeta { size_bytes: 100, token_count: 5 })
+        .save_from_slot(
+            &key1,
+            0,
+            CacheMeta {
+                size_bytes: 100,
+                token_count: 5,
+            },
+        )
         .await
         .expect("save_from_slot failed");
     let entries: Vec<_> = std::fs::read_dir(&slots_dir)
@@ -196,7 +203,14 @@ async fn real_llama_server_save_restore_evict_round_trip() {
         .expect("failed to open a second LlamaServerSlotStore with a tighter budget");
     let key2 = key(&model_path, "e2e-prefix-2");
     evicting_store
-        .save_from_slot(&key2, 0, CacheMeta { size_bytes: 100, token_count: 5 })
+        .save_from_slot(
+            &key2,
+            0,
+            CacheMeta {
+                size_bytes: 100,
+                token_count: 5,
+            },
+        )
         .await
         .expect("save_from_slot for key2 failed");
 
