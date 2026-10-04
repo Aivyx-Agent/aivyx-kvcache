@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,6 +25,12 @@ const SLOT_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 /// native `/slots/{id}?action=save|restore` API (see `restore_into_slot`/
 /// `save_from_slot`) against files under `store_path/slots/`, indexed by a
 /// `Manifest` at `store_path/manifest.db`.
+///
+/// `max_bytes` is per-instance, not stored in the (shared, cross-process)
+/// manifest -- when several processes `open` the same `store_path` with
+/// different budgets, each one's own eviction only ever enforces its own
+/// `max_bytes` against the shared total, so in steady state the smallest
+/// configured budget wins. See the README's own note on this.
 pub struct LlamaServerSlotStore {
     manifest: Manifest,
     slots_dir: PathBuf,
@@ -99,6 +106,39 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// Process-local counter folded into `unique_slot_filename`'s nonce --
+/// only needs to be unique across concurrent saves *within this process*;
+/// `std::process::id()` (also folded in) is what disambiguates it from
+/// every other process sharing the same store.
+static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh filename for a **new** save of `key`'s slot -- unlike
+/// `slot_filename` (deterministic, used to locate a key's *current* file
+/// for reads and eviction), every call here returns a different name, even
+/// for the same key. This is what closes two related failure modes a
+/// purely deterministic per-key filename used to have: two concurrent
+/// savers of the same key racing to write the exact same physical file
+/// (whoever finishes last silently wins, corrupting or truncating
+/// whichever save "lost"), and an eviction of the *existing* row for this
+/// key -- still pointing at that same deterministic name -- deleting the
+/// file a fresh save just finished writing to it, or a failed fresh save's
+/// own error-cleanup deleting the existing, still-valid row's file because
+/// they happened to share a name. See `save_from_slot`'s doc comment for
+/// how the resulting unique file is then swapped in and the previous one
+/// cleaned up only after the new row has committed.
+///
+/// Combines this process's pid with a per-process monotonic counter: unique
+/// within a single process's lifetime (the counter) and, assuming no pid
+/// reuse, across every process concurrently sharing one store (the pid).
+/// This is collision avoidance, not a security boundary, so that's enough
+/// without pulling in a `rand` dependency.
+fn unique_slot_filename(key: &CacheKey) -> String {
+    let base = slot_filename(key);
+    let base = base.strip_suffix(".slot").unwrap_or(&base);
+    let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!("{base}-{}-{nonce:x}.slot", std::process::id())
 }
 
 impl LlamaServerSlotStore {
@@ -212,9 +252,17 @@ impl LlamaServerSlotStore {
     /// record it under `key`. Checked against the configured budget
     /// *before* issuing the HTTP call, specifically to avoid making
     /// llama-server perform a save it's just going to be evicted right
-    /// back out of — `record` (called at the end here) re-checks the same
-    /// budget too, so this stays correct even if called with a `meta` that
-    /// wasn't actually pre-checked by some future caller.
+    /// back out of — `record_returning_previous` (called below) re-checks
+    /// the same budget too, so this stays correct even if called with a
+    /// `meta` that wasn't actually pre-checked by some future caller.
+    ///
+    /// Every call writes to its own fresh filename (`unique_slot_filename`,
+    /// never `key`'s deterministic `slot_filename`) specifically so this
+    /// never collides with whatever file `key`'s *existing* row (if any)
+    /// still points at -- on success, that existing file is only removed
+    /// *after* the new row has committed below, never before (a concurrent
+    /// restore could still be reading it) and never by the error path (see
+    /// below), which only ever touches the file *this* attempt just wrote.
     pub async fn save_from_slot(
         &self,
         key: &CacheKey,
@@ -227,7 +275,7 @@ impl LlamaServerSlotStore {
                 max_bytes: self.max_bytes,
             });
         }
-        let filename = slot_filename(key);
+        let filename = unique_slot_filename(key);
         let url = format!("{}/slots/{slot_id}?action=save", self.base_url);
         self.http
             .post(&url)
@@ -256,17 +304,76 @@ impl LlamaServerSlotStore {
             Err(_) => meta,
         };
 
-        let handle = CacheHandle::new(filename);
-        if let Err(err) = self.record(key, handle, real_meta).await {
-            // record() rejected the *real* size as over budget even though
-            // the caller's own estimate passed the pre-check above --
-            // llama-server already wrote the file, so clean up the orphan
-            // rather than leave a file on disk the manifest never learns
-            // about.
-            let _ = std::fs::remove_file(&path);
-            return Err(err);
+        let handle = CacheHandle::new(filename.clone());
+        let previous_handle = match self.record_returning_previous(key, handle, real_meta).await {
+            Ok(previous) => previous,
+            Err(err) => {
+                // record() rejected the *real* size as over budget even
+                // though the caller's own estimate passed the pre-check
+                // above -- llama-server already wrote the file, so clean
+                // up the orphan rather than leave a file on disk the
+                // manifest never learns about. This is always exactly the
+                // file *this* attempt just wrote (`filename` is unique per
+                // call), so it can never reach out and delete a different,
+                // still-valid row's file.
+                let _ = std::fs::remove_file(&path);
+                return Err(err);
+            }
+        };
+
+        // The new row is committed under `key` now -- only now is it safe
+        // to remove whatever file the row we just superseded pointed at.
+        // Doing this any earlier would risk deleting a file a concurrent
+        // restore is still reading; doing it via the error path above
+        // would risk deleting it on a failed *subsequent* save instead of
+        // this one's own file. A `NotFound` here just means something else
+        // (another process's own save of this key, or a prior eviction)
+        // already cleaned it up.
+        if let Some(previous_handle) = previous_handle
+            && previous_handle.as_str() != filename
+            && previous_handle.is_safe_filename()
+        {
+            let previous_path = self.slots_dir.join(previous_handle.as_str());
+            match std::fs::remove_file(&previous_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %previous_path.display(),
+                        "kvcache could not remove a superseded slot file after a successful \
+                         save; the new row has already committed, so this is now an orphan"
+                    );
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Same as the `KvCacheStore::record` trait method, but also returns
+    /// whatever handle `key` pointed at immediately before this call (see
+    /// `Manifest::insert_returning_previous`). Kept as an inherent method
+    /// (not part of the public trait) since only `save_from_slot` needs
+    /// the previous handle -- every other caller of `record` just needs
+    /// the plain `Result<(), KvCacheError>`.
+    async fn record_returning_previous(
+        &self,
+        key: &CacheKey,
+        handle: CacheHandle,
+        meta: CacheMeta,
+    ) -> Result<Option<CacheHandle>, KvCacheError> {
+        if meta.size_bytes > self.max_bytes {
+            return Err(KvCacheError::SlotExceedsBudget {
+                size_bytes: meta.size_bytes,
+                max_bytes: self.max_bytes,
+            });
+        }
+        let previous = self
+            .manifest
+            .insert_returning_previous(key, &handle, meta)
+            .await?;
+        self.evict_to_budget().await?;
+        Ok(previous)
     }
 }
 
@@ -286,17 +393,21 @@ impl KvCacheStore for LlamaServerSlotStore {
         handle: CacheHandle,
         meta: CacheMeta,
     ) -> Result<(), KvCacheError> {
-        if meta.size_bytes > self.max_bytes {
-            return Err(KvCacheError::SlotExceedsBudget {
-                size_bytes: meta.size_bytes,
-                max_bytes: self.max_bytes,
-            });
-        }
-        self.manifest.insert(key, &handle, meta).await?;
-        self.evict_to_budget().await?;
+        self.record_returning_previous(key, handle, meta).await?;
         Ok(())
     }
 
+    /// Note on multi-process deployments: `evict_and_remove` (via the
+    /// shared sqlite manifest) atomically removes manifest rows *before*
+    /// this loop deletes their backing files, so once a row is selected
+    /// for eviction here it is gone from the index regardless of whether
+    /// its file deletion below actually succeeds. A `remove_file` error
+    /// that isn't a plain `NotFound` is therefore logged and skipped
+    /// (its file becomes an orphan on disk, not counted as freed) rather
+    /// than aborting the loop -- an early return here used to leave every
+    /// *later* row's file un-deleted too (even when perfectly removable),
+    /// and surfaced as an `Err` out of whatever unrelated `record()` call
+    /// happened to trigger this eviction pass.
     async fn evict_to_budget(&self) -> Result<EvictionReport, KvCacheError> {
         let removed = self.manifest.evict_and_remove(self.max_bytes).await?;
         let mut report = EvictionReport::default();
@@ -312,12 +423,25 @@ impl KvCacheStore for LlamaServerSlotStore {
             }
             let path = self.slots_dir.join(row.handle.as_str());
             match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(KvCacheError::Backend(e.to_string())),
+                Ok(()) => {
+                    report.evicted_count += 1;
+                    report.bytes_freed += row.size_bytes;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    report.evicted_count += 1;
+                    report.bytes_freed += row.size_bytes;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "kvcache eviction could not remove a slot file after its manifest row \
+                         was already removed; continuing with any remaining evictions instead \
+                         of aborting (the row no longer counts toward budget, but its file is \
+                         now orphaned on disk)"
+                    );
+                }
             }
-            report.evicted_count += 1;
-            report.bytes_freed += row.size_bytes;
         }
         Ok(report)
     }
@@ -327,8 +451,63 @@ impl KvCacheStore for LlamaServerSlotStore {
 mod tests {
     use super::*;
     use crate::conformance::assert_conformance;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// Test-only `Respond` that mimics what the real llama-server does on a
+    /// successful `/slots?action=save`: it actually writes `size_bytes` of
+    /// real content to disk, under whatever filename the request asked it
+    /// to save as. Needed because `save_from_slot` now picks a fresh,
+    /// unique filename on every call (see `unique_slot_filename`) -- a test
+    /// can no longer pre-compute the exact path it will use and pre-stage a
+    /// file there ahead of time; it has to discover the real filename from
+    /// the request, exactly as the real server would receive it. Records
+    /// every filename it was asked to save as into `observed`, in call
+    /// order, so the test can look up the real on-disk path after the fact.
+    struct WriteRealSlotFile {
+        dir: PathBuf,
+        /// Size (in bytes) to write for the Nth call (0-indexed); the last
+        /// entry is reused for any call beyond the list's length.
+        sizes: Vec<usize>,
+        call_index: AtomicUsize,
+        observed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WriteRealSlotFile {
+        fn new(dir: PathBuf, size_bytes: usize) -> (Self, Arc<Mutex<Vec<String>>>) {
+            Self::with_sizes(dir, vec![size_bytes])
+        }
+
+        fn with_sizes(dir: PathBuf, sizes: Vec<usize>) -> (Self, Arc<Mutex<Vec<String>>>) {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    dir,
+                    sizes,
+                    call_index: AtomicUsize::new(0),
+                    observed: observed.clone(),
+                },
+                observed,
+            )
+        }
+    }
+
+    impl Respond for WriteRealSlotFile {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let filename = body["filename"].as_str().unwrap().to_string();
+            let idx = self.call_index.fetch_add(1, Ordering::SeqCst);
+            let size = *self
+                .sizes
+                .get(idx)
+                .unwrap_or_else(|| self.sizes.last().unwrap());
+            std::fs::write(self.dir.join(&filename), vec![0u8; size]).unwrap();
+            self.observed.lock().unwrap().push(filename);
+            ResponseTemplate::new(200)
+        }
+    }
 
     fn key(prefix: &str) -> CacheKey {
         CacheKey {
@@ -572,22 +751,24 @@ mod tests {
     #[tokio::test]
     async fn save_from_slot_uses_the_real_file_size_not_the_caller_supplied_placeholder() {
         let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slots_dir = dir.path().join("slots");
+        // The mock stands in for llama-server actually writing the real
+        // 5,000-byte file to disk, under whatever filename the request
+        // asks for (save_from_slot no longer uses a predictable,
+        // precomputable filename -- see unique_slot_filename).
+        let (responder, _observed) = WriteRealSlotFile::new(slots_dir, 5_000);
         Mock::given(method("POST"))
             .and(path_regex(r"^/slots/0$"))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(responder)
             .mount(&server)
             .await;
 
-        let dir = tempfile::tempdir().unwrap();
         // Budget is exactly key1's real size -- key1 alone fits, but
         // key1 + key2 together don't, forcing eviction once key2 lands.
         let store = LlamaServerSlotStore::open(dir.path(), server.uri(), 5_000).unwrap();
 
         let k1 = key("p1");
-        // Simulate llama-server having written the real file BEFORE our
-        // mock HTTP response returns -- wiremock itself never writes real
-        // files, so pre-stage it at the exact path save_from_slot expects.
-        std::fs::write(store.slot_path(&k1), vec![0u8; 5_000]).unwrap();
 
         // Caller passes a wildly wrong placeholder (1 byte, matching the
         // real-world caller this bug was found in). If the fix works, the
@@ -665,21 +846,24 @@ mod tests {
     #[tokio::test]
     async fn save_from_slot_deletes_the_orphaned_file_when_the_real_size_exceeds_budget() {
         let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slots_dir = dir.path().join("slots");
+        // The mock writes a real 5,000-byte file under whatever filename
+        // the request names -- standing in for llama-server already
+        // having written it by the time the save "completes".
+        let (responder, observed) = WriteRealSlotFile::new(slots_dir.clone(), 5_000);
         Mock::given(method("POST"))
             .and(path_regex(r"^/slots/0$"))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(responder)
             .mount(&server)
             .await;
 
-        let dir = tempfile::tempdir().unwrap();
         // max_bytes is large enough that the caller's placeholder (1 byte)
         // passes the pre-check, but smaller than the real file that turns
         // out to exist on disk once the save "completes".
         let store = LlamaServerSlotStore::open(dir.path(), server.uri(), 100).unwrap();
 
         let k1 = key("p1");
-        let path = store.slot_path(&k1);
-        std::fs::write(&path, vec![0u8; 5_000]).unwrap();
 
         let err = store
             .save_from_slot(
@@ -693,6 +877,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KvCacheError::SlotExceedsBudget { .. }));
+
+        let filename = observed.lock().unwrap()[0].clone();
+        let path = slots_dir.join(&filename);
         assert!(
             !path.exists(),
             "the orphaned file llama-server already wrote must be cleaned up when the real \
@@ -778,5 +965,225 @@ mod tests {
                  fired instead of the configured 150ms timeout"
             ),
         }
+    }
+
+    /// Regression test for a real reliability bug: `slot_filename` is
+    /// deterministic per `CacheKey`, so a naive `save_from_slot` that used
+    /// it directly would pick the exact same on-disk filename for every
+    /// save of the same key -- re-saving a key overwrites, in place, the
+    /// very file the manifest's *existing* row for that key still points
+    /// at while the save is in flight, and (see the next test) a
+    /// concurrent eviction of that pre-existing row can delete the file
+    /// out from under a save that just finished writing to it. The fix is
+    /// `unique_slot_filename`: every save gets its own filename, and the
+    /// previous file is only removed after the new row has committed.
+    #[tokio::test]
+    async fn resaving_the_same_key_never_reuses_the_previous_physical_filename() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slots_dir = dir.path().join("slots");
+        let (responder, observed) = WriteRealSlotFile::new(slots_dir.clone(), 10);
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/slots/0$"))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+
+        let store = LlamaServerSlotStore::open(dir.path(), server.uri(), 1_000).unwrap();
+        let k = key("p1");
+
+        store
+            .save_from_slot(
+                &k,
+                0,
+                CacheMeta {
+                    size_bytes: 10,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let first_filename = observed.lock().unwrap()[0].clone();
+        let first_path = slots_dir.join(&first_filename);
+        assert!(first_path.exists(), "the first save's file must exist");
+
+        store
+            .save_from_slot(
+                &k,
+                0,
+                CacheMeta {
+                    size_bytes: 10,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let second_filename = observed.lock().unwrap()[1].clone();
+        assert_ne!(
+            first_filename, second_filename,
+            "two saves of the same key must never reuse the same physical filename"
+        );
+        let second_path = slots_dir.join(&second_filename);
+        assert!(second_path.exists(), "the new file must exist");
+        assert!(
+            !first_path.exists(),
+            "the superseded file must be cleaned up once the new row has committed"
+        );
+
+        // The manifest's current row for this key must always point at a
+        // file that actually exists -- never the deleted, superseded one.
+        let handle = store.find(&k).await.unwrap().unwrap();
+        assert_eq!(handle.as_str(), second_filename);
+        assert!(slots_dir.join(handle.as_str()).exists());
+    }
+
+    /// Regression test: the save error path must only ever remove the
+    /// file it *just* wrote for *this* attempt, never a different,
+    /// already-committed row's file. Under the old deterministic-filename
+    /// scheme, a second (failing) save of the same key wrote to the exact
+    /// same path as the first (still-valid) save, so the error path's
+    /// cleanup deleted the first row's file out from under it -- leaving a
+    /// manifest row pointing at nothing.
+    #[tokio::test]
+    async fn save_from_slot_error_path_never_deletes_an_earlier_committed_rows_file() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let slots_dir = dir.path().join("slots");
+        // First call writes 10 real bytes (fits the budget below); the
+        // second writes 500, blowing it.
+        let (responder, observed) = WriteRealSlotFile::with_sizes(slots_dir.clone(), vec![10, 500]);
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/slots/0$"))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+
+        let store = LlamaServerSlotStore::open(dir.path(), server.uri(), 10).unwrap();
+        let k = key("p1");
+
+        store
+            .save_from_slot(
+                &k,
+                0,
+                CacheMeta {
+                    size_bytes: 10,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let first_filename = observed.lock().unwrap()[0].clone();
+        let first_path = slots_dir.join(&first_filename);
+        assert!(first_path.exists());
+
+        let err = store
+            .save_from_slot(
+                &k,
+                0,
+                CacheMeta {
+                    size_bytes: 1,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KvCacheError::SlotExceedsBudget { .. }));
+
+        let second_filename = observed.lock().unwrap()[1].clone();
+        assert_ne!(
+            first_filename, second_filename,
+            "each save attempt must use its own filename"
+        );
+        let second_path = slots_dir.join(&second_filename);
+        assert!(
+            !second_path.exists(),
+            "the rejected attempt's own oversized file must be cleaned up"
+        );
+        assert!(
+            first_path.exists(),
+            "an earlier, still-recorded row's file must never be deleted by a later failed \
+             save's error path"
+        );
+        assert_eq!(
+            store.find(&k).await.unwrap().unwrap().as_str(),
+            first_filename,
+            "the manifest must still point at the earlier, still-valid save"
+        );
+    }
+
+    /// Regression test: `evict_to_budget` must keep going even if it can't
+    /// remove one row's backing file -- `evict_and_remove` has already
+    /// atomically deleted the manifest rows by the time file deletion
+    /// runs, so aborting partway through used to leave later rows'
+    /// (perfectly removable) files un-deleted and orphaned, and also
+    /// surfaced as an `Err` out of the `record()` call that triggered the
+    /// eviction in the first place -- failing an unrelated save over a
+    /// single bad file elsewhere in the store. A directory stands in for
+    /// "a file `remove_file` can't delete" (fails with a real, non-
+    /// `NotFound` error on Linux).
+    #[tokio::test]
+    async fn evict_to_budget_continues_past_a_file_it_cannot_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LlamaServerSlotStore::open(dir.path(), "http://127.0.0.1:0", 100).unwrap();
+
+        let k1 = key("p1");
+        let k2 = key("p2");
+        let k3 = key("p3");
+
+        // k1's "file" is actually a directory -- remove_file on it fails
+        // with something other than NotFound.
+        std::fs::create_dir_all(store.slot_path(&k1)).unwrap();
+        store
+            .record(
+                &k1,
+                CacheHandle::new(slot_filename(&k1)),
+                CacheMeta {
+                    size_bytes: 100,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let p2_path = store.slot_path(&k2);
+        std::fs::write(&p2_path, b"p2 bytes").unwrap();
+        store
+            .record(
+                &k2,
+                CacheHandle::new(slot_filename(&k2)),
+                CacheMeta {
+                    size_bytes: 100,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Recording k3 forces eviction of both k1 and k2 (LRU order).
+        // Before the fix, failing to remove k1's (directory) file aborted
+        // eviction entirely and this call itself returned Err.
+        store
+            .record(
+                &k3,
+                CacheHandle::new(slot_filename(&k3)),
+                CacheMeta {
+                    size_bytes: 100,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(store.find(&k1).await.unwrap().is_none());
+        assert!(store.find(&k2).await.unwrap().is_none());
+        assert!(store.find(&k3).await.unwrap().is_some());
+
+        // k2 comes after k1 in eviction order -- a return-early bug would
+        // have aborted before ever attempting k2's (perfectly removable)
+        // file.
+        assert!(
+            !p2_path.exists(),
+            "k2's file must still be deleted even though k1 (evicted first) couldn't be"
+        );
     }
 }

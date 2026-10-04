@@ -29,6 +29,17 @@ disk, headroom for multi-GB caches at long context windows, and
 survival across an OS reinstall are all deliberate goals, not just
 config flexibility.
 
+**Each process evicts to its own configured budget.** `max_bytes` is a
+constructor argument (`LlamaServerSlotStore::open`'s third parameter),
+not something stored in the shared manifest, so when multiple processes
+point at the same store directory with *different* budgets, each one's
+`record`/`evict_to_budget` call enforces only the limit it was itself
+opened with against the shared total. In steady state the store can
+never hold more than the **smallest** of all the budgets configured by
+processes actively writing to it — whichever process has the tightest
+budget keeps evicting the shared pool back down to its own limit,
+regardless of what any other process configured.
+
 **Adopted by both real consumers.** `aivyx-coder`'s adoption shipped
 2026-08-21; `aivyx`'s own shipped 2026-08-22 (architecturally different
 from `aivyx-coder`'s — `aivyx` builds a fresh `LlmPlanner` every turn, so

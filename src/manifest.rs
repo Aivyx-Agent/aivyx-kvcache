@@ -96,16 +96,62 @@ impl Manifest {
         Ok(())
     }
 
+    /// Plain upsert, discarding the previous handle `insert_returning_previous`
+    /// would otherwise report. Only this crate's own tests call it directly
+    /// today (production code always wants the previous handle, so it goes
+    /// through `insert_returning_previous` instead) -- kept as a thin
+    /// wrapper, same as `remove` below, rather than duplicating the upsert
+    /// SQL a second time.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn insert(
         &self,
         key: &CacheKey,
         handle: &CacheHandle,
         meta: CacheMeta,
     ) -> Result<(), KvCacheError> {
+        self.insert_returning_previous(key, handle, meta).await?;
+        Ok(())
+    }
+
+    /// Same as `insert`, but also returns whatever handle `key` pointed at
+    /// *before* this upsert (`None` if this is the first save for `key`).
+    /// Atomic (a single `BEGIN IMMEDIATE` transaction covers the read and
+    /// the upsert) so two concurrent savers of the same key can never both
+    /// observe the same "previous" handle while believing they're the one
+    /// superseding it. Exists specifically so `LlamaServerSlotStore::
+    /// save_from_slot` can delete the previous handle's backing file only
+    /// *after* the new row has committed -- deleting it any earlier risks
+    /// removing a file a concurrent restore is still reading, or leaving a
+    /// row pointing at nothing if this process crashed in between.
+    pub(crate) async fn insert_returning_previous(
+        &self,
+        key: &CacheKey,
+        handle: &CacheHandle,
+        meta: CacheMeta,
+    ) -> Result<Option<CacheHandle>, KvCacheError> {
         let now_secs = now_secs();
         let now_nanos = now_nanos();
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| KvCacheError::Backend(e.to_string()))?;
+
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT handle FROM slots
+                 WHERE backend_id = ?1 AND model_id = ?2 AND build_hash = ?3 AND prefix_hash = ?4",
+                params![
+                    key.backend_id,
+                    key.model_id,
+                    key.build_hash,
+                    key.prefix_hash
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| KvCacheError::Backend(e.to_string()))?;
+
+        tx.execute(
             "INSERT INTO slots
                 (backend_id, model_id, build_hash, prefix_hash, handle, size_bytes, token_count, created_at_secs, last_used_at_nanos, hit_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
@@ -128,7 +174,10 @@ impl Manifest {
             ],
         )
         .map_err(|e| KvCacheError::Backend(e.to_string()))?;
-        Ok(())
+
+        tx.commit()
+            .map_err(|e| KvCacheError::Backend(e.to_string()))?;
+        Ok(previous.map(CacheHandle::new))
     }
 
     /// Removes a single row by key. Production eviction paths use the
@@ -358,6 +407,46 @@ mod tests {
         m.remove(&key("p1")).await.unwrap();
         assert!(m.find(&key("p1")).await.unwrap().is_none());
         assert_eq!(m.total_bytes().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn insert_returning_previous_reports_none_then_the_superseded_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Manifest::open(&dir.path().join("manifest.db")).unwrap();
+
+        // First save for this key: nothing was there before.
+        let previous = m
+            .insert_returning_previous(
+                &key("p1"),
+                &CacheHandle::new("v1.slot"),
+                CacheMeta {
+                    size_bytes: 100,
+                    token_count: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(previous, None);
+
+        // Re-saving the same key reports the handle it's about to replace,
+        // not the new one -- this is what lets a caller clean up the old
+        // file only after the new row has committed.
+        let previous = m
+            .insert_returning_previous(
+                &key("p1"),
+                &CacheHandle::new("v2.slot"),
+                CacheMeta {
+                    size_bytes: 200,
+                    token_count: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(previous, Some(CacheHandle::new("v1.slot")));
+
+        // The row itself now reflects the new save.
+        let row = m.find(&key("p1")).await.unwrap().unwrap();
+        assert_eq!(row.handle, CacheHandle::new("v2.slot"));
     }
 
     #[tokio::test]
