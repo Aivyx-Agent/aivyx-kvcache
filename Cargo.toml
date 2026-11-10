@@ -18,5 +18,5 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 wiremock = "0.6.5"
