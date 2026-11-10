@@ -172,8 +172,12 @@ impl LlamaServerSlotStore {
         // `reqwest::Client::new()`, itself just `.build().expect(..)`)
         // since a caller opening a store deserves to see that rather
         // than a panic.
+        // No proxy: llama-server is a local service, and reqwest otherwise
+        // sends even loopback requests to HTTP_PROXY/ALL_PROXY when one is
+        // set (aivyx-vision audit 2026-11-11, X1).
         let http = reqwest::Client::builder()
             .timeout(http_timeout)
+            .no_proxy()
             .build()
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
         Ok(Self {
