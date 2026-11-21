@@ -305,14 +305,21 @@ impl LlamaServerSlotStore {
         }
         let filename = unique_slot_filename(key);
         let url = format!("{}/slots/{slot_id}?action=save", self.base_url);
-        self.http
+        let response = self
+            .http
             .post(&url)
             .json(&serde_json::json!({ "filename": filename }))
             .send()
             .await
-            .map_err(|e| KvCacheError::Backend(e.to_string()))?
-            .error_for_status()
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
+        // Redirects are never followed, so a 3xx is a failed save, not a
+        // success: `error_for_status` would accept it.
+        if !response.status().is_success() {
+            return Err(KvCacheError::Backend(format!(
+                "llama-server slot save returned {}",
+                response.status()
+            )));
+        }
 
         // llama-server just wrote the real file to disk -- measure it
         // rather than trust the caller's meta.size_bytes, which is often a
@@ -919,7 +926,11 @@ mod tests {
         );
     }
 
-    async fn recorded_store(dir: &std::path::Path, url: String, http: reqwest::Client) -> LlamaServerSlotStore {
+    async fn recorded_store(
+        dir: &std::path::Path,
+        url: String,
+        http: reqwest::Client,
+    ) -> LlamaServerSlotStore {
         let store = LlamaServerSlotStore::open_with_client(dir, url, 1_000, http).unwrap();
         store
             .record(
@@ -955,28 +966,77 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        // Built through the real `open` path so its default client is covered.
-        let store = LlamaServerSlotStore::open(dir.path(), origin.uri(), 1_000).unwrap();
-        store
-            .record(
-                &key("p1"),
-                CacheHandle::new("p1.slot"),
-                CacheMeta {
-                    size_bytes: 10,
-                    token_count: 1,
-                },
-            )
-            .await
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
             .unwrap();
+        let store = recorded_store(dir.path(), origin.uri(), http).await;
 
         let restored = store.restore_into_slot(&key("p1"), 0).await.unwrap();
-        assert!(!restored, "a redirect must not count as a confirmed restore");
+        assert!(
+            !restored,
+            "a redirect must not count as a confirmed restore"
+        );
         assert_eq!(origin.received_requests().await.unwrap().len(), 1);
         assert_eq!(
             target.received_requests().await.unwrap().len(),
             0,
             "the redirect target must never be contacted"
         );
+    }
+
+    /// A 307 on save must not count as a successful save: no manifest row
+    /// change, the previous entry stays restorable, and its file survives.
+    #[tokio::test]
+    async fn save_does_not_follow_redirects_or_record_a_phantom_row() {
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&target)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/slots/0$"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/slots/0", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let store = recorded_store(dir.path(), origin.uri(), http).await;
+        let old_file = dir.path().join("p1.slot");
+        std::fs::write(&old_file, b"old").unwrap();
+
+        let result = store
+            .save_from_slot(
+                &key("p1"),
+                0,
+                CacheMeta {
+                    size_bytes: 20,
+                    token_count: 2,
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(KvCacheError::Backend(_))),
+            "a redirect must fail the save, got {result:?}"
+        );
+        assert_eq!(
+            store.find(&key("p1")).await.unwrap().unwrap().as_str(),
+            "p1.slot",
+            "the previous entry must be untouched"
+        );
+        assert!(old_file.exists(), "the previous file must not be deleted");
+        assert_eq!(origin.received_requests().await.unwrap().len(), 1);
+        assert_eq!(target.received_requests().await.unwrap().len(), 0);
     }
 
     /// `open_with_client` uses the caller's client as-is: a client with a
