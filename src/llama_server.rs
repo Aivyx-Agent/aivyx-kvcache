@@ -19,7 +19,7 @@ use crate::{CacheHandle, CacheKey, CacheMeta, EvictionReport, KvCacheError, KvCa
 /// of every turn, before the turn's own cancellation check, so a wedged
 /// llama-server connection previously hung every subsequent turn
 /// indefinitely rather than falling back to an unpinned/cold session.
-const SLOT_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+pub const SLOT_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The real, llama-server-backed `KvCacheStore`. Drives llama-server's
 /// native `/slots/{id}?action=save|restore` API (see `restore_into_slot`/
@@ -163,10 +163,6 @@ impl LlamaServerSlotStore {
         max_bytes: u64,
         http_timeout: Duration,
     ) -> Result<Self, KvCacheError> {
-        let store_path = store_path.into();
-        let manifest = Manifest::open(&store_path.join("manifest.db"))?;
-        let slots_dir = store_path.join("slots");
-        std::fs::create_dir_all(&slots_dir).map_err(|e| KvCacheError::Backend(e.to_string()))?;
         // `.build()` only fails on TLS/resolver init issues -- surfaced
         // as a real `Err` here (unlike the previous infallible
         // `reqwest::Client::new()`, itself just `.build().expect(..)`)
@@ -175,11 +171,39 @@ impl LlamaServerSlotStore {
         // No proxy: llama-server is a local service, and reqwest otherwise
         // sends even loopback requests to HTTP_PROXY/ALL_PROXY when one is
         // set (aivyx-vision audit 2026-11-11, X1).
+        // No redirects: model servers are local-only, so a redirect is
+        // never followed (reqwest's default of 10 would let a server
+        // answering 307/308 make us re-send slot requests to any host).
         let http = reqwest::Client::builder()
             .timeout(http_timeout)
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| KvCacheError::Backend(e.to_string()))?;
+        Self::open_with_client(store_path, base_url, max_bytes, http)
+    }
+
+    /// Same as `open`, but uses the caller's `reqwest::Client` as-is
+    /// instead of building one. This lets a product hand over its own
+    /// hardened client. The client is used unmodified, so it must provide:
+    ///
+    /// - a timeout suited to multi-GB slot transfers (see
+    ///   [`SLOT_HTTP_TIMEOUT`]); with none, a wedged server hangs forever;
+    /// - `no_proxy()`, so loopback requests never go to `HTTP_PROXY`;
+    /// - redirects disabled (`redirect::Policy::none()`), since model
+    ///   servers are local-only and a redirect must never be followed;
+    /// - ideally a resolver that only returns local addresses, for example
+    ///   `aivyx_route::discovery::LocalOnlyDns`.
+    pub fn open_with_client(
+        store_path: impl Into<PathBuf>,
+        base_url: impl Into<String>,
+        max_bytes: u64,
+        http: reqwest::Client,
+    ) -> Result<Self, KvCacheError> {
+        let store_path = store_path.into();
+        let manifest = Manifest::open(&store_path.join("manifest.db"))?;
+        let slots_dir = store_path.join("slots");
+        std::fs::create_dir_all(&slots_dir).map_err(|e| KvCacheError::Backend(e.to_string()))?;
         Ok(Self {
             manifest,
             slots_dir,
@@ -893,6 +917,91 @@ mod tests {
             store.find(&k1).await.unwrap().is_none(),
             "no manifest entry should exist for a save that was ultimately rejected"
         );
+    }
+
+    async fn recorded_store(dir: &std::path::Path, url: String, http: reqwest::Client) -> LlamaServerSlotStore {
+        let store = LlamaServerSlotStore::open_with_client(dir, url, 1_000, http).unwrap();
+        store
+            .record(
+                &key("p1"),
+                CacheHandle::new("p1.slot"),
+                CacheMeta {
+                    size_bytes: 10,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+        store
+    }
+
+    /// A 307 from the slot server must not be followed: the second server
+    /// (which would answer 200, i.e. a "confirmed restore") gets no request.
+    #[tokio::test]
+    async fn restore_does_not_follow_redirects() {
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&target)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/slots/0$"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/slots/0", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Built through the real `open` path so its default client is covered.
+        let store = LlamaServerSlotStore::open(dir.path(), origin.uri(), 1_000).unwrap();
+        store
+            .record(
+                &key("p1"),
+                CacheHandle::new("p1.slot"),
+                CacheMeta {
+                    size_bytes: 10,
+                    token_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let restored = store.restore_into_slot(&key("p1"), 0).await.unwrap();
+        assert!(!restored, "a redirect must not count as a confirmed restore");
+        assert_eq!(origin.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            target.received_requests().await.unwrap().len(),
+            0,
+            "the redirect target must never be contacted"
+        );
+    }
+
+    /// `open_with_client` uses the caller's client as-is: a client with a
+    /// tiny timeout times out against a slow mock (so the restore is a miss).
+    #[tokio::test]
+    async fn open_with_client_uses_the_given_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/slots/0$"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800)))
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = recorded_store(dir.path(), server.uri(), http).await;
+
+        let started = std::time::Instant::now();
+        let restored = store.restore_into_slot(&key("p1"), 0).await.unwrap();
+        assert!(!restored, "the caller's 100ms timeout must apply");
+        assert!(started.elapsed() < Duration::from_millis(700));
     }
 
     /// Regression test for the backlog item closing this store's own

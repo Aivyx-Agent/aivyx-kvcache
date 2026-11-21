@@ -82,3 +82,9 @@ must be the one you told llama-server to save into. Get this wrong and
 every save/restore call 501s with "This server does not support slots
 action" (if `--slot-save-path` is missing entirely) or silently can't
 find its own files (if the paths don't match).
+
+**HTTP client.** `LlamaServerSlotStore::open` builds its own client: no
+proxy, a 60 s timeout, and redirects are never followed (model servers are
+local-only). To supply your own hardened client (for example one with a
+local-addresses-only resolver), use `LlamaServerSlotStore::open_with_client`;
+its doc comment lists what the client must provide.
