@@ -1,7 +1,7 @@
 [package]
 name = "aivyx-kvcache"
 description = "Backend-agnostic local KV-cache persistence/sharing layer for local LLM serving"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "BUSL-1.1"
 publish = false

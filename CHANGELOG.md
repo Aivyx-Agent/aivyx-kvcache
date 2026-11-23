@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.2] - Unreleased
+
+- `SLOT_HTTP_TIMEOUT` is now re-exported at the crate root (`aivyx_kvcache::SLOT_HTTP_TIMEOUT`), so consumers need not hard-code the 60 s default.
+
 ## 0.1.1
 
 - Security: redirects are never followed by the HTTP client `LlamaServerSlotStore::open` builds. Model servers are local-only, so a 307/308 can no longer make slot save/restore requests go to another host.
