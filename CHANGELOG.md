@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.2] - Unreleased
+## [0.1.2] - 2026-11-23
 
 - `SLOT_HTTP_TIMEOUT` is now re-exported at the crate root (`aivyx_kvcache::SLOT_HTTP_TIMEOUT`), so consumers need not hard-code the 60 s default.
 
