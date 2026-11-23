@@ -11,7 +11,7 @@ mod in_memory;
 pub use in_memory::InMemoryKvCacheStore;
 
 mod llama_server;
-pub use llama_server::LlamaServerSlotStore;
+pub use llama_server::{LlamaServerSlotStore, SLOT_HTTP_TIMEOUT};
 
 pub mod cli;
 
@@ -129,6 +129,11 @@ pub trait KvCacheStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_http_timeout_is_reexported_at_crate_root() {
+        assert_eq!(crate::SLOT_HTTP_TIMEOUT, std::time::Duration::from_secs(60));
+    }
 
     #[test]
     fn cache_key_equality_is_field_wise() {
