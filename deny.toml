@@ -66,4 +66,10 @@ version = 2
 # surface; accepted ones go in `ignore` with the reason.
 yanked = "deny"
 unmaintained = "all"
-ignore = []
+ignore = [
+    # This branch exists only for aivyx-pa, which is held on rusqlite 0.40 by
+    # matrix-sdk-sqlite; pa accepted RUSTSEC-2026-0459 on 2026-11-11 (see its
+    # deny.toml). master is on rusqlite 0.41 and needs no ignore. Remove this
+    # with the branch, when matrix-sdk-sqlite accepts rusqlite 0.41.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite -wal memory exposure; fix blocked by pa's matrix-sdk-sqlite 0.19.1 (rusqlite ^0.40.2); accepted in aivyx-pa 2026-11-11" },
+]
